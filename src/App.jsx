@@ -80,7 +80,8 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const MODEL_URL = "/models";
+        // Resolve against the deploy base so the app works under a sub-path (e.g. GitHub Pages).
+        const MODEL_URL = `${import.meta.env.BASE_URL}models`;
         setLoadProgress(10);
         await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
         setLoadProgress(45);

@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Relative base: the build works from any static host or sub-path
+  // (GitHub Pages project site, Netlify, a folder on a school intranet...).
+  base: './',
   plugins: [react()],
   test: {
     environment: 'jsdom',
