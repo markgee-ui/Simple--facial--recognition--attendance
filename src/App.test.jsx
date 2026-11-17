@@ -30,6 +30,7 @@ async function renderToMainScreen(user) {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   loadFromUri.mockReset();
   loadFromUri.mockImplementation(() => Promise.resolve());
   mockCamera(fakeStream);
@@ -92,6 +93,31 @@ describe("App", () => {
 
     await user.click(within(row).getByRole("button", { name: /clear/i }));
     expect(screen.getByText("0 Absent")).toBeInTheDocument();
+  });
+
+  it("persists roster and attendance across reloads", async () => {
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    await user.click(await screen.findByRole("button", { name: /enable camera/i }, { timeout: 2000 }));
+    await user.type(screen.getByLabelText(/new student name/i), "Ada Lovelace{Enter}");
+    await user.click(within(screen.getByRole("listitem", { name: "Ada Lovelace" })).getByRole("button", { name: /^absent$/i }));
+    unmount();
+
+    await renderToMainScreen(user);
+    expect(screen.getByText("Ada Lovelace")).toBeInTheDocument();
+    expect(screen.getByText("1 Absent")).toBeInTheDocument();
+  });
+
+  it("resets all stored data after confirmation", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await renderToMainScreen(user);
+    await user.type(screen.getByLabelText(/new student name/i), "Ada Lovelace{Enter}");
+    await user.click(screen.getByRole("button", { name: /summary/i }));
+    await user.click(screen.getByRole("button", { name: /reset all data/i }));
+    await user.click(screen.getByRole("button", { name: /roster/i }));
+    expect(screen.queryByText("Ada Lovelace")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(8);
   });
 
   it("summary percentages are well-formed", async () => {
