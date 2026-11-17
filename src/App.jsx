@@ -1,5 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import * as faceapi from '@vladmandic/face-api';
+import {
+  PRESENT, ABSENT, summarize, percent, markPresent, markAbsent, clearMark,
+  addStudent as addStudentToRoster, initials, avatarColor, formatTime, formatDate,
+} from "./lib/attendance";
+import {
+  ENROLL_MIN_CONFIDENCE, SCAN_MIN_CONFIDENCE, SCAN_INTERVAL_MS,
+  coverTransform, projectBox, projectPoints, paddedCropRect, buildMatcher as buildFaceMatcher, resolveMatch,
+} from "./lib/recognition";
 
 const INITIAL_STUDENTS = [
   { id: 1, name: "Mark Ngugi" },
@@ -12,24 +20,19 @@ const INITIAL_STUDENTS = [
   { id: 8, name: "Peter Kamau" },
 ];
 
-const formatTime = (d) => d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
-const formatDate = (d) => d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
-
 function Avatar({ name, size = 40, photo }) {
-  const initials = name.split(" ").map((n) => n[0]).join("").slice(0, 2);
-  const palette = ["#1D9E75","#378ADD","#7F77DD","#D4537E","#D85A30","#BA7517","#E24B4A","#639922"];
-  const bg = palette[name.charCodeAt(0) % palette.length];
+  const bg = avatarColor(name);
   if (photo) return <img src={photo} alt={name} style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} />;
   return (
     <div style={{ width: size, height: size, borderRadius: "50%", background: bg, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: size * 0.34, flexShrink: 0 }}>
-      {initials}
+      {initials(name)}
     </div>
   );
 }
 
 const sc = (s) => {
-  if (s === "present") return { dot: "#1D9E75", text: "#1D9E75", bg: "rgba(29,158,117,0.12)", label: "Present" };
-  if (s === "absent")  return { dot: "#E24B4A", text: "#E24B4A", bg: "rgba(226,75,74,0.12)",  label: "Absent"  };
+  if (s === PRESENT) return { dot: "#1D9E75", text: "#1D9E75", bg: "rgba(29,158,117,0.12)", label: "Present" };
+  if (s === ABSENT)  return { dot: "#E24B4A", text: "#E24B4A", bg: "rgba(226,75,74,0.12)",  label: "Absent"  };
   return                       { dot: "#555",    text: "#666",    bg: "rgba(255,255,255,0.05)", label: "Not marked" };
 };
 
@@ -60,17 +63,16 @@ export default function App() {
   const [landmarks, setLandmarks] = useState(null);
   const [facingMode, setFacingMode] = useState("user");
   const [newName, setNewName] = useState("");
+  const [addError, setAddError] = useState("");
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const scanLoopRef = useRef(null);
+  const detectingRef = useRef(false);
   const matcherRef = useRef(null);
 
   const now = new Date();
-  const present  = Object.values(attendance).filter(v => v === "present").length;
-  const absent   = Object.values(attendance).filter(v => v === "absent").length;
-  const unmarked = students.length - present - absent;
-  const enrolledCount = Object.keys(enrolled).length;
+  const { present, absent, unmarked, enrolledCount } = summarize(students, attendance, enrolled);
 
   // Load face-api models
   useEffect(() => {
@@ -141,17 +143,13 @@ export default function App() {
     if (!videoRef.current) return;
     setEnrollMsg("Detecting face…");
     const video = videoRef.current;
-    const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.45 });
+    const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: ENROLL_MIN_CONFIDENCE });
     const det = await faceapi.detectSingleFace(video, opts).withFaceLandmarks().withFaceDescriptor();
     if (!det) { setEnrollMsg("No face detected — adjust position and try again"); return; }
-    const c = document.createElement("canvas");
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext("2d").drawImage(video, 0, 0);
-    const box = det.detection.box;
-    const pad = 50;
+    const crop = paddedCropRect(det.detection.box, 50, video.videoWidth, video.videoHeight);
     const fc = document.createElement("canvas");
-    fc.width = box.width + pad*2; fc.height = box.height + pad*2;
-    fc.getContext("2d").drawImage(c, box.x-pad, box.y-pad, fc.width, fc.height, 0, 0, fc.width, fc.height);
+    fc.width = crop.width; fc.height = crop.height;
+    fc.getContext("2d").drawImage(video, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
     const photo = fc.toDataURL("image/jpeg", 0.85);
     setEnrolled(prev => ({ ...prev, [enrollTarget.id]: { photo, descriptor: det.descriptor } }));
     setEnrollPhoto(photo);
@@ -161,39 +159,38 @@ export default function App() {
     setTimeout(() => { setPhase("main"); setEnrollTarget(null); }, 1400);
   };
 
-  const buildMatcher = useCallback(() => {
-    const entries = students.filter(s => enrolled[s.id]);
-    if (!entries.length) return null;
-    const labeled = entries.map(s => new faceapi.LabeledFaceDescriptors(String(s.id), [enrolled[s.id].descriptor]));
-    return new faceapi.FaceMatcher(labeled, 0.52);
-  }, [students, enrolled]);
+  const buildMatcher = useCallback(() => buildFaceMatcher(faceapi, students, enrolled), [students, enrolled]);
 
   const runScanLoop = useCallback(() => {
     if (scanLoopRef.current) clearInterval(scanLoopRef.current);
     setScanning(true);
     scanLoopRef.current = setInterval(async () => {
+      // Inference can take longer than the interval on slow devices; skip a
+      // tick instead of stacking concurrent detections on the GPU.
+      if (detectingRef.current) return;
       const video = videoRef.current;
       if (!video || video.readyState < 2) return;
       const matcher = matcherRef.current || (matcherRef.current = buildMatcher());
       if (!matcher) { setScanMsg("No enrolled students — enrol first"); return; }
-      const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: 0.42 });
-      const det = await faceapi.detectSingleFace(video, opts).withFaceLandmarks().withFaceDescriptor();
-      if (!det) { setBoxStyle(null); setLandmarks(null); setScanResult(null); setScanMsg("Looking for a face…"); return; }
-      const vw = video.offsetWidth || 480;
-      const vh = video.offsetHeight || 360;
-      const sx = vw / (video.videoWidth || 640);
-      const sy = vh / (video.videoHeight || 480);
-      const b = det.detection.box;
-      setBoxStyle({ left: b.x*sx, top: b.y*sy, width: b.width*sx, height: b.height*sy });
-      setLandmarks(det.landmarks.positions.map(p => ({ x: p.x*sx, y: p.y*sy })));
-      const match = matcher.findBestMatch(det.descriptor);
-      if (match.label === "unknown") { setScanResult(null); setScanMsg("Face detected — not recognised"); return; }
-      const student = students.find(s => String(s.id) === match.label);
-      if (!student) return;
-      const conf = Math.round((1 - match.distance) * 100);
-      setScanResult({ student, conf });
-      setScanMsg("Recognised: " + student.name + " (" + conf + "% confidence)");
-    }, 700);
+      detectingRef.current = true;
+      try {
+        const opts = new faceapi.SsdMobilenetv1Options({ minConfidence: SCAN_MIN_CONFIDENCE });
+        const det = await faceapi.detectSingleFace(video, opts).withFaceLandmarks().withFaceDescriptor();
+        if (!det) { setBoxStyle(null); setLandmarks(null); setScanResult(null); setScanMsg("Looking for a face…"); return; }
+        const t = coverTransform(video.videoWidth, video.videoHeight, video.offsetWidth, video.offsetHeight);
+        setBoxStyle(projectBox(det.detection.box, t));
+        setLandmarks(projectPoints(det.landmarks.positions, t));
+        const result = resolveMatch(matcher.findBestMatch(det.descriptor), students);
+        if (!result) { setScanResult(null); setScanMsg("Face detected — not recognised"); return; }
+        setScanResult(result);
+        setScanMsg("Recognised: " + result.student.name + " (" + result.conf + "% confidence)");
+      } catch (e) {
+        console.error(e);
+        setScanMsg("Detection error — retrying…");
+      } finally {
+        detectingRef.current = false;
+      }
+    }, SCAN_INTERVAL_MS);
   }, [buildMatcher, students]);
 
   const openScan = async () => {
@@ -209,7 +206,7 @@ export default function App() {
 
   const confirmPresent = () => {
     if (!scanResult) return;
-    setAttendance(a => ({ ...a, [scanResult.student.id]: "present" }));
+    setAttendance(a => markPresent(a, scanResult.student.id));
     setScanResult(null); setBoxStyle(null); setLandmarks(null);
     setScanMsg("Marked present! Scanning for next face…");
   };
@@ -223,14 +220,18 @@ export default function App() {
       const s = await startStream(nf);
       attachStream(s);
       if (inScan) setTimeout(runScanLoop, 500);
-    } catch {}
+    } catch {
+      const msg = "Could not switch camera — this device may only have one";
+      if (inScan) setScanMsg(msg); else setEnrollMsg(msg);
+    }
   };
 
   const addStudent = () => {
-    const name = newName.trim();
-    if (!name) return;
-    setStudents(s => [...s, { id: Date.now(), name }]);
+    const { students: next, error } = addStudentToRoster(students, newName);
+    if (error) { setAddError(error); return; }
+    setStudents(next);
     setNewName("");
+    setAddError("");
   };
 
   // ── Loading screen ──
@@ -431,18 +432,20 @@ export default function App() {
         {tab === "roster" && (
           <div>
             <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
-              <input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => e.key === "Enter" && addStudent()}
+              <input aria-label="New student name" value={newName} onChange={e => { setNewName(e.target.value); setAddError(""); }} onKeyDown={e => e.key === "Enter" && addStudent()}
                 placeholder="Add new student name…"
                 style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "10px 14px", color: "#e0e0e0", fontSize: 14, outline: "none" }} />
               <button onClick={addStudent} style={{ ...styles.btnGreen, padding: "10px 20px", fontSize: 14 }}>+ Add</button>
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {addError && <p role="alert" style={{ color: "#E24B4A", fontSize: 13, margin: "-10px 0 16px" }}>{addError}</p>}
+            <div role="list" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {students.map(student => {
-                const status = attendance[student.id];
+                const record = attendance[student.id];
+                const status = record?.status;
                 const isEnrolled = !!enrolled[student.id];
                 const c = sc(status);
                 return (
-                  <div key={student.id} style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, padding: "13px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                  <div key={student.id} role="listitem" aria-label={student.name} style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, padding: "13px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
                     <Avatar name={student.name} size={46} photo={enrolled[student.id]?.photo} />
                     <div style={{ flex: 1, minWidth: 140 }}>
                       <div style={{ fontWeight: 600, color: "#e8e8e8", fontSize: 15 }}>{student.name}</div>
@@ -450,15 +453,15 @@ export default function App() {
                         {isEnrolled
                           ? <span style={{ fontSize: 11, color: "#1D9E75", fontWeight: 600, background: "rgba(29,158,117,0.1)", padding: "2px 8px", borderRadius: 20 }}>✓ Face enrolled</span>
                           : <span style={{ fontSize: 11, color: "#444", fontWeight: 600, background: "rgba(255,255,255,0.03)", padding: "2px 8px", borderRadius: 20 }}>Not enrolled</span>}
-                        {status && <span style={{ fontSize: 11, color: c.text, fontWeight: 500 }}>· {status === "present" ? "Present " + formatTime(now) : c.label}</span>}
+                        {status && <span style={{ fontSize: 11, color: c.text, fontWeight: 500 }}>· {status === PRESENT ? "Present " + formatTime(record.at) : c.label}</span>}
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <button onClick={() => openEnroll(student)} style={{ background: isEnrolled ? "rgba(55,138,221,0.1)" : "rgba(127,119,221,0.12)", border: "1px solid " + (isEnrolled ? "rgba(55,138,221,0.25)" : "rgba(127,119,221,0.25)"), color: isEnrolled ? "#378ADD" : "#7F77DD", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
                         {isEnrolled ? "Re-enrol" : "Enrol"}
                       </button>
-                      {status !== "present" && <button onClick={() => setAttendance(a => ({ ...a, [student.id]: "absent" }))} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", color: "#555", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Absent</button>}
-                      {status && <button onClick={() => setAttendance(a => { const n = {...a}; delete n[student.id]; return n; })} style={{ background: "rgba(226,75,74,0.07)", border: "1px solid rgba(226,75,74,0.15)", color: "#E24B4A", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Clear</button>}
+                      {status !== PRESENT && <button onClick={() => setAttendance(a => markAbsent(a, student.id))} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", color: "#555", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Absent</button>}
+                      {status && <button onClick={() => setAttendance(a => clearMark(a, student.id))} style={{ background: "rgba(226,75,74,0.07)", border: "1px solid rgba(226,75,74,0.15)", color: "#E24B4A", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Clear</button>}
                     </div>
                   </div>
                 );
@@ -488,10 +491,10 @@ export default function App() {
               <div key={bar.label} style={{ background: "rgba(255,255,255,0.025)", borderRadius: 12, padding: 16, marginBottom: 12 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                   <span style={{ fontSize: 13, color: "#555" }}>{bar.label}</span>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>{Math.round((bar.value / bar.total) * 100)}%</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>{percent(bar.value, bar.total)}%</span>
                 </div>
                 <div style={{ height: 7, background: "rgba(255,255,255,0.05)", borderRadius: 99, overflow: "hidden" }}>
-                  <div style={{ height: "100%", width: (bar.value/bar.total*100) + "%", background: bar.color, borderRadius: 99, transition: "width 0.6s ease" }} />
+                  <div style={{ height: "100%", width: percent(bar.value, bar.total) + "%", background: bar.color, borderRadius: 99, transition: "width 0.6s ease" }} />
                 </div>
               </div>
             ))}
@@ -499,13 +502,13 @@ export default function App() {
               <div style={{ marginTop: 20 }}>
                 <div style={{ fontSize: 11, color: "#444", fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 12 }}>Present Students</div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(110px,1fr))", gap: 10 }}>
-                  {students.filter(s => attendance[s.id] === "present").map(s => (
+                  {students.filter(s => attendance[s.id]?.status === PRESENT).map(s => (
                     <div key={s.id} style={{ background: "rgba(29,158,117,0.07)", border: "1px solid rgba(29,158,117,0.15)", borderRadius: 12, padding: "14px 10px", textAlign: "center" }}>
                       <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
                         <Avatar name={s.name} size={48} photo={enrolled[s.id]?.photo} />
                       </div>
                       <div style={{ fontSize: 12, fontWeight: 600, color: "#ccc" }}>{s.name.split(" ")[0]}</div>
-                      <div style={{ fontSize: 11, color: "#1D9E75", marginTop: 2 }}>✓ {formatTime(now)}</div>
+                      <div style={{ fontSize: 11, color: "#1D9E75", marginTop: 2 }}>✓ {formatTime(attendance[s.id].at)}</div>
                     </div>
                   ))}
                 </div>
