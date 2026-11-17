@@ -8,6 +8,7 @@ import {
   ENROLL_MIN_CONFIDENCE, SCAN_MIN_CONFIDENCE, SCAN_INTERVAL_MS,
   coverTransform, projectBox, projectPoints, paddedCropRect, buildMatcher as buildFaceMatcher, resolveMatch,
 } from "./lib/recognition";
+import { loadState, saveState, clearState } from "./lib/storage";
 
 const INITIAL_STUDENTS = [
   { id: 1, name: "Mark Ngugi" },
@@ -49,9 +50,10 @@ export default function App() {
   const [phase, setPhase] = useState("loading");
   const [loadProgress, setLoadProgress] = useState(0);
   const [permError, setPermError] = useState("");
-  const [students, setStudents] = useState(INITIAL_STUDENTS);
-  const [enrolled, setEnrolled] = useState({});
-  const [attendance, setAttendance] = useState({});
+  const [saved] = useState(() => loadState());
+  const [students, setStudents] = useState(() => saved?.students ?? INITIAL_STUDENTS);
+  const [enrolled, setEnrolled] = useState(() => saved?.enrolled ?? {});
+  const [attendance, setAttendance] = useState(() => saved?.attendance ?? {});
   const [tab, setTab] = useState("roster");
   const [enrollTarget, setEnrollTarget] = useState(null);
   const [enrollMsg, setEnrollMsg] = useState("");
@@ -102,6 +104,15 @@ export default function App() {
 
   useEffect(() => () => stopStream(), [stopStream]);
   useEffect(() => { matcherRef.current = null; }, [enrolled]);
+  useEffect(() => { saveState({ students, enrolled, attendance }); }, [students, enrolled, attendance]);
+
+  const resetAll = () => {
+    if (!window.confirm("Delete the roster, all enrolled faces and today's attendance from this browser?")) return;
+    clearState();
+    setStudents(INITIAL_STUDENTS);
+    setEnrolled({});
+    setAttendance({});
+  };
 
   const startStream = async (facing) => {
     const fm = facing || facingMode;
@@ -514,6 +525,10 @@ export default function App() {
                 </div>
               </div>
             )}
+            <div style={{ marginTop: 28, paddingTop: 16, borderTop: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 12, color: "#555" }}>Roster, face data and today's attendance are stored only in this browser.</span>
+              <button onClick={resetAll} style={{ ...styles.btnGhost, color: "#E24B4A", fontSize: 13, padding: "8px 16px" }}>Reset all data</button>
+            </div>
           </div>
         )}
       </div>
