@@ -47,7 +47,7 @@ This app is the minimum viable alternative:
 flowchart LR
     subgraph Browser["Browser (everything runs here)"]
         direction LR
-        Cam["Webcam<br/>getUserMedia"] --> Video["&lt;video&gt;"]
+        Cam["Webcam<br/>getUserMedia"] --> Video["video element"]
 
         subgraph FaceAPI["face-api.js on TensorFlow.js (WebGL)"]
             direction TB
